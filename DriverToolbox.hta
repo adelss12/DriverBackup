@@ -1,0 +1,245 @@
+<!doctype html>
+<html>
+<head>
+<meta http-equiv="x-ua-compatible" content="IE=9" />
+<meta charset="utf-8" />
+<title>Windows Driver Toolbox</title>
+<hta:application id="driverToolbox" applicationname="Windows Driver Toolbox" border="thick" caption="yes" maximizebutton="yes" minimizebutton="yes" showintaskbar="yes" singleinstance="yes" sysmenu="yes" />
+<style>
+* { box-sizing: border-box; }
+body { margin:0; background:#eef3f8; color:#1e293b; font-family:Segoe UI, Tahoma, Arial; direction:rtl; font-size:17px; overflow-x:hidden; }
+.top { background:#123b63; color:white; padding:0; height:112px; }
+.top-inner { position:relative; max-width:1352px; height:100%; margin:auto; padding:18px 22px 14px; text-align:right; }
+.top h1 { margin:0 0 4px; font-size:30px; font-weight:600; }
+.top p { margin:0; color:#c9def2; font-size:18px; }
+.top .exit { position:absolute; left:22px; top:24px; padding:10px 24px; border:1px solid #f2b8b5; background:#c9362b; color:white; border-radius:5px; font-size:17px; cursor:pointer; }
+.layout { display:block; min-height:700px; }
+.side { width:calc(100% - 48px); max-width:1352px; margin:12px auto 0; background:#fff; padding:12px 22px 8px; border:1px solid #dbe5ef; border-radius:7px; text-align:right; white-space:normal; }
+.side button { display:inline-block; vertical-align:top; margin:0 0 7px 8px; padding:12px 16px; border:1px solid #d2deea; background:#f8fafc; color:#23415e; border-radius:5px; text-align:center; font-size:17px; cursor:pointer; min-width:145px; }
+.side button:hover { background:#e7f1fb; border-color:#79a9d5; }
+.side button.primary { background:#1672b8; color:#fff; border-color:#1672b8; }
+.side .small { display:block; width:100%; clear:both; color:#66788a; font-size:15px; line-height:1.5; margin-top:4px; white-space:normal; }
+.content { padding:24px; max-width:1400px; margin:auto; }
+.card { background:white; border:1px solid #dbe5ef; border-radius:7px; padding:20px; margin-bottom:18px; box-shadow:0 2px 5px #cdd8e333; }
+.card h2 { margin:0 0 15px; color:#174e7b; font-size:22px; }
+.path { color:#536b80; background:#f6f9fc; border:1px solid #dbe5ef; padding:10px; min-height:38px; word-break:break-all; }
+#status { min-height:210px; max-height:310px; overflow:auto; white-space:pre-wrap; font-family:Consolas, monospace; direction:ltr; text-align:left; background:#101820; color:#d6e8f5; padding:14px; border-radius:5px; font-size:15px; }
+.spec { white-space:pre-wrap; font-family:Consolas, monospace; direction:ltr; text-align:left; line-height:1.5; background:#f6f9fc; padding:14px; min-height:170px; font-size:16px; }
+.ok { color:#18794e; } .err { color:#b42318; }
+</style>
+<script language="JScript">
+var shell = new ActiveXObject("WScript.Shell");
+var shellApp = new ActiveXObject("Shell.Application");
+var fso = new ActiveXObject("Scripting.FileSystemObject");
+var htaPath = unescape(location.pathname.replace(/^\/+/, "").replace(/\//g, "\\"));
+var appDir = fso.GetParentFolderName(htaPath);
+var backupRoot = appDir + "\\BackupDriver";
+var windowsDir = shell.ExpandEnvironmentStrings("%windir%");
+
+function systemTool(name) {
+  var sysnative = windowsDir + "\\Sysnative\\" + name;
+  var system32 = windowsDir + "\\System32\\" + name;
+  if (fso.FileExists(sysnative)) return quote(sysnative);
+  return quote(system32);
+}
+
+function log(text) {
+  var box = document.getElementById("status");
+  box.innerText += "[" + new Date().toLocaleTimeString() + "] " + text + "\n";
+  box.scrollTop = box.scrollHeight;
+}
+function clearLog() { document.getElementById("status").innerText = ""; }
+function exitApp() { window.close(); }
+function ensureFolder(path) { if (!fso.FolderExists(path)) fso.CreateFolder(path); }
+function ensureBackupFolder() {
+  if (fso.FolderExists(backupRoot)) return true;
+  try {
+    fso.CreateFolder(backupRoot);
+    log("تم إنشاء مجلد BackupDriver تلقائيًا.");
+    return true;
+  } catch (e) {
+    log("تعذر إنشاء مجلد BackupDriver: " + e.message);
+    alert("تعذر إنشاء مجلد BackupDriver بجانب البرنامج.");
+    return false;
+  }
+}
+function quote(path) { return '"' + path.replace(/"/g, '""') + '"'; }
+function run(command) {
+  var process = shell.Exec("cmd.exe /d /c " + command);
+  var output = "";
+  while (!process.StdOut.AtEndOfStream) output += process.StdOut.ReadLine() + "\n";
+  while (!process.StdErr.AtEndOfStream) output += process.StdErr.ReadLine() + "\n";
+  return { code: process.ExitCode, output: output };
+}
+function collectInf(folder, result) {
+  var files = new Enumerator(folder.Files);
+  for (; !files.atEnd(); files.moveNext()) if (String(files.item().Name).toLowerCase().slice(-4) == ".inf") result.push(String(files.item().Path));
+  var folders = new Enumerator(folder.SubFolders);
+  for (; !folders.atEnd(); folders.moveNext()) collectInf(folders.item(), result);
+}
+function dateStamp() {
+  var d = new Date();
+  function n(v) { return v < 10 ? "0" + v : v; }
+  return d.getFullYear() + n(d.getMonth()+1) + n(d.getDate()) + "_" + n(d.getHours()) + n(d.getMinutes()) + n(d.getSeconds());
+}
+function writeText(path, text) { var file = fso.CreateTextFile(path, true, true); file.Write(text); file.Close(); }
+
+function checkAdministrator() {
+  try {
+    var p = shell.Exec("cmd.exe /d /c fltmc >nul 2>&1");
+    while (!p.StdOut.AtEndOfStream) p.StdOut.ReadLine();
+    while (!p.StdErr.AtEndOfStream) p.StdErr.ReadLine();
+    if (p.ExitCode != 0) {
+    shellApp.ShellExecute(windowsDir + "\\System32\\mshta.exe", quote(htaPath), "", "runas", 1);
+      window.close();
+      return false;
+    }
+  } catch (e) { log("تعذر التحقق من صلاحيات المسؤول: " + e.message); }
+  return true;
+}
+function initialize() {
+  try {
+    var startWidth = Math.min(1000, screen.availWidth);
+    var startHeight = Math.min(700, screen.availHeight);
+    window.resizeTo(startWidth, startHeight);
+    window.moveTo(Math.max(0, (screen.availWidth - startWidth) / 2), Math.max(0, (screen.availHeight - startHeight) / 2));
+  } catch (e) {}
+  if (!checkAdministrator()) return;
+  var oldRoot = appDir + "\\DriverBacup";
+  if (fso.FolderExists(oldRoot) && !fso.FolderExists(backupRoot)) fso.MoveFolder(oldRoot, backupRoot);
+  ensureBackupFolder();
+  document.getElementById("selectedPath").innerText = backupRoot;
+}
+
+function backup() {
+  clearLog();
+  if (!ensureBackupFolder()) return;
+  var target = backupRoot;
+  log("بدء تصدير التعريفات إلى: " + target);
+  var r = run(systemTool("dism.exe") + " /Online /Export-Driver /Destination:" + quote(target));
+  log(r.output || "انتهى DISM.");
+  var inf = []; collectInf(fso.GetFolder(target), inf);
+  if (!inf.length) {
+    log("لم يُخرج DISM ملفات تعريف. تتم المحاولة بأداة Windows البديلة...");
+    var fallback = "Export-WindowsDriver -Online -Destination '" + target.replace(/'/g, "''") + "'";
+    var fallbackResult = run("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command " + quote(fallback));
+    log(fallbackResult.output || "انتهى أمر Windows البديل.");
+    inf = []; collectInf(fso.GetFolder(target), inf);
+  }
+  if (!inf.length) {
+    log("تتم المحاولة الأخيرة باستخدام PnPUtil...");
+    var pnpResult = run(systemTool("pnputil.exe") + " /export-driver * " + quote(target));
+    log(pnpResult.output || "انتهى أمر PnPUtil.");
+    inf = []; collectInf(fso.GetFolder(target), inf);
+  }
+  if (inf.length) {
+    writeText(target + "\\device_info.txt", getSpecsText());
+    log("نجح النسخ: " + inf.length + " حزمة تعريف.");
+    alert("تم نسخ " + inf.length + " حزمة تعريف بنجاح.");
+  } else {
+    log("فشل النسخ: لم يتم العثور على ملفات INF بعد كل المحاولات.");
+    alert("لم تكتمل عملية النسخ. افتح سجل العمليات لمعرفة رسالة Windows التفصيلية.");
+  }
+}
+function restore() {
+  if (!ensureBackupFolder()) return;
+  var source = backupRoot;
+  clearLog(); var inf = []; collectInf(fso.GetFolder(source), inf);
+  if (!inf.length) { alert("لم يتم العثور على ملفات INF."); return; }
+  var report = "Windows Driver Toolbox - تقرير الاستعادة\r\n";
+  report += new Date().toLocaleString() + "\r\n";
+  report += "============================================================\r\n";
+  report += "المصدر: " + source + "\r\nإجمالي الحزم: " + inf.length + "\r\n\r\n";
+  var ok = 0, failed = 0;
+  for (var i=0; i<inf.length; i++) {
+    log("[" + (i+1) + "/" + inf.length + "] تثبيت " + inf[i]);
+    var r = run(systemTool("pnputil.exe") + " -a " + quote(inf[i]) + " -i");
+    if (r.code == 0 || r.code == 3010) { ok++; report += "[نجح" + (r.code == 3010 ? " - يلزم إعادة التشغيل" : "") + "] " + inf[i] + "\r\n"; }
+    else { failed++; report += "[فشل] " + inf[i] + "\r\n" + r.output + "\r\n"; }
+  }
+  report += "\r\nالنتيجة: نجح " + ok + " | فشل " + failed + "\r\n";
+  var reportPath = source + "\\restore_report_" + dateStamp() + ".txt";
+  writeText(reportPath, report);
+  log("اكتملت الاستعادة. نجح: " + ok + " | فشل: " + failed);
+  log("تم حفظ التقرير: " + reportPath);
+  alert("اكتملت الاستعادة.\nنجح: " + ok + "\nفشل: " + failed + "\n\nتم حفظ التقرير داخل مجلد النسخة.");
+}
+function getSpecsText() {
+  var script = "$c=Get-WmiObject Win32_ComputerSystem; $o=Get-WmiObject Win32_OperatingSystem; $p=Get-WmiObject Win32_Processor|select -First 1; $b=Get-WmiObject Win32_BIOS; 'Computer: '+$env:COMPUTERNAME; 'Manufacturer: '+$c.Manufacturer; 'Model: '+$c.Model; 'CPU: '+$p.Name; 'Memory GB: '+[math]::Round($c.TotalPhysicalMemory/1GB,1); 'Windows: '+$o.Caption+' '+$o.Version; 'Architecture: '+$o.OSArchitecture; 'BIOS: '+$b.SMBIOSBIOSVersion";
+  var r = run("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command " + quote(script));
+  return r.output || "تعذر قراءة مواصفات الجهاز.";
+}
+function specs() { clearLog(); var text = getSpecsText(); document.getElementById("specs").innerText = text; log("تم عرض مواصفات الجهاز."); }
+
+function createEmptyZip(path) {
+  var xml = new ActiveXObject("Msxml2.DOMDocument.6.0");
+  var node = xml.createElement("b64"); node.dataType = "bin.base64"; node.text = "UEsFBgAAAAAAAAAAAAAAAAAAAAAAAA==";
+  var stream = new ActiveXObject("ADODB.Stream"); stream.Type = 1; stream.Open(); stream.Write(node.nodeTypedValue); stream.SaveToFile(path, 2); stream.Close();
+}
+function exportZip() {
+  if (!ensureBackupFolder()) return;
+  var source = backupRoot;
+  var infFiles = [];
+  collectInf(fso.GetFolder(source), infFiles);
+  if (!infFiles.length) {
+    clearLog();
+    log("لا يمكن ضغط النسخة: مجلد BackupDriver لا يحتوي على ملفات تعريف INF.");
+    alert("يجب تنفيذ نسخ التعريفات أولًا قبل إنشاء ملف ZIP.");
+    return;
+  }
+  var destination = appDir;
+  var zipPath = destination + "\\BackupDriver_" + dateStamp() + ".zip";
+  clearLog();
+  var psCommand = "Compress-Archive -Path '" + source.replace(/'/g, "''") + "\\*' -DestinationPath '" + zipPath.replace(/'/g, "''") + "' -Force";
+  var psResult = run("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command " + quote(psCommand));
+  if (psResult.code == 0 && fso.FileExists(zipPath) && fso.GetFile(zipPath).Size > 22) {
+    log("اكتمل ضغط النسخة باستخدام أداة Windows.");
+    alert("تم حفظ ملف ZIP صالح بنجاح في:\n" + zipPath);
+    return;
+  }
+  if (fso.FileExists(zipPath)) fso.DeleteFile(zipPath, true);
+  log("تعذر استخدام Compress-Archive؛ تتم تجربة ضغط Windows المحلي...");
+  createEmptyZip(zipPath);
+  var app = new ActiveXObject("Shell.Application");
+  app.NameSpace(zipPath).CopyHere(app.NameSpace(source).Items(), 20);
+  log("بدأ ضغط النسخة إلى: " + zipPath);
+  waitForZip(zipPath, source, 0);
+}
+function waitForZip(zipPath, source, elapsed) {
+  var ready = false;
+  try {
+    var zipFolder = new ActiveXObject("Shell.Application").NameSpace(zipPath);
+    var sourceFolder = new ActiveXObject("Shell.Application").NameSpace(source);
+    ready = fso.GetFile(zipPath).Size > 22 && zipFolder.Items().Count >= sourceFolder.Items().Count;
+  } catch (e) {}
+  if (ready) {
+    log("اكتمل ضغط النسخة: " + zipPath);
+    alert("تم حفظ ملف ZIP بنجاح في:\n" + zipPath);
+  } else if (elapsed < 120000) {
+    setTimeout(function(){ waitForZip(zipPath, source, elapsed + 1000); }, 1000);
+  } else {
+    log("انتهت مهلة انتظار ZIP؛ تحقق من الملف قبل نقله.");
+    alert("انتهت مهلة الضغط. تحقق من حجم ملف ZIP قبل الاعتماد عليه.");
+  }
+}
+</script>
+</head>
+<body onload="initialize()">
+<div class="top"><div class="top-inner"><button class="exit" onclick="exitApp()">خروج</button><h1>Windows Driver Toolbox</h1><p>نسخ واستعادة تعريفات Windows دون اتصال بالإنترنت</p></div></div>
+<div class="layout">
+  <div class="side">
+    <button class="primary" onclick="backup()">⬆ نسخ التعريفات</button>
+    <button onclick="restore()">⬇ استعادة التعريفات</button>
+    <button onclick="exportZip()">▣ ضغط النسخة إلى ZIP</button>
+    <button onclick="specs()">▤ مواصفات الجهاز</button>
+    <button onclick="clearLog()">مسح السجل</button>
+    <div class="small">المجلد الحالي للنسخة: BackupDriver<br>يتم حفظ تقرير الاستعادة داخله بصيغة TXT.</div>
+  </div>
+  <div class="content">
+    <div class="card"><h2>المجلد المحدد</h2><div id="selectedPath" class="path">لم يتم اختيار مجلد</div></div>
+    <div class="card"><h2>مواصفات الجهاز</h2><div id="specs" class="spec">اضغط «مواصفات الجهاز» لعرض المعلومات.</div></div>
+    <div class="card"><h2>سجل العمليات</h2><div id="status">جاهز.</div></div>
+  </div>
+</div>
+</body>
+</html>
