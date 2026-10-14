@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 APP_TITLE = "نسخ التعريفات — Windows Driver Toolbox"
 ROOT_NAME = "BackupDriver"           # مجلد واحد لكل النسخ، بجانب البرنامج
 LEGACY_NAMES = ("DriversBackup",)    # مجلد الإصدار القديم من القائمة الإنجليزية
@@ -253,15 +253,138 @@ def backup_inf_files(b: Backup):
 # النسخ الاحتياطي
 # ============================================================================
 
-def create_backup(base: Path, info: dict, log=print, runner=run, ps=powershell):
-    """ينشئ نسخة جديدة في مجلد مستقل. يُرجع (Backup أو None، رسالة)."""
-    now = datetime.now()
+# فئات التعريفات التي يختار منها المستخدم (حسب «فئة الجهاز» في ويندوز)
+CATEGORIES = [
+    ("display", "كرت الشاشة", {"display"}),
+    ("motherboard", "اللوحة الأم والشرائح (Chipset و USB و التخزين)",
+     {"system", "hdc", "scsiadapter", "usb", "securitydevices", "firmware", "processor", "smartcardreader"}),
+    ("network", "الشبكة (واي فاي وإيثرنت)", {"net", "netservice", "nettrans", "netclient"}),
+    ("audio", "الصوت", {"media", "audioendpoint", "audioprocessingobject"}),
+    ("bluetooth", "البلوتوث", {"bluetooth"}),
+    ("printer", "الطابعات والماسحات", {"printer", "printqueue", "image"}),
+    ("camera", "الكاميرا", {"camera"}),
+    ("input", "الفأرة ولوحة المفاتيح ولوحة اللمس", {"mouse", "keyboard", "hidclass"}),
+    ("other", "أخرى (برامج مساعدة وملحقات)", set()),
+]
+CATEGORY_LABELS = {k: label for k, label, _ in CATEGORIES}
+
+PACKAGES_PS = r"""
+$ErrorActionPreference = 'Stop'
+$inuse = @{}
+Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.InfName -like 'oem*.inf' } | ForEach-Object {
+  $k = $_.InfName.ToLower(); if (-not $inuse.ContainsKey($k)) { $inuse[$k] = $_.DeviceName }
+}
+@(Get-WindowsDriver -Online | ForEach-Object {
+  $size = 0
+  try { $size = (Get-ChildItem (Split-Path $_.OriginalFileName) -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum } catch {}
+  $d = ''; try { $d = $_.Date.ToString('yyyy-MM-dd') } catch {}
+  $k = $_.Driver.ToLower()
+  [PSCustomObject]@{ Inf = $_.Driver; Class = "$($_.ClassName)"; Provider = "$($_.ProviderName)"; Version = "$($_.Version)"
+    Date = $d; Size = [int64]$size; InUse = $inuse.ContainsKey($k); Device = "$($inuse[$k])" }
+}) | ConvertTo-Json -Depth 3 -Compress
+"""
+
+
+def category_of(class_name: str) -> str:
+    c = (class_name or "").strip().lower()
+    for key, _, classes in CATEGORIES:
+        if c in classes:
+            return key
+    return "other"
+
+
+def list_driver_packages(ps=powershell):
+    """قائمة حزم التعريفات المثبتة (غير المدمجة في ويندوز) مع فئتها وحجمها وهل هي مستخدمة الآن."""
+    rc, out = ps(PACKAGES_PS, timeout=300)
+    if rc != 0:
+        raise RuntimeError(out[-400:] or f"رمز {rc}")
+    text = out.strip().splitlines()[-1] if out.strip() else "[]"
+    data = json.loads(text)
+    if isinstance(data, dict):
+        data = [data]
+    pkgs = []
+    for p in data:
+        if not p.get("Inf"):
+            continue
+        p["Category"] = category_of(p.get("Class"))
+        p["Size"] = int(p.get("Size") or 0)
+        p["InUse"] = bool(p.get("InUse"))
+        pkgs.append(p)
+    return pkgs
+
+
+def summarize(pkgs, in_use_only=False):
+    """{الفئة: {"count", "size", "devices"}} لعرضها في نافذة الاختيار."""
+    out = {k: {"count": 0, "size": 0, "devices": []} for k, _, _ in CATEGORIES}
+    for p in pkgs:
+        if in_use_only and not p["InUse"]:
+            continue
+        c = out[p["Category"]]
+        c["count"] += 1
+        c["size"] += p["Size"]
+        name = p.get("Device") or p.get("Provider")
+        if name and name not in c["devices"]:
+            c["devices"].append(name)
+    return out
+
+
+def new_backup_folder(base: Path, info: dict, now: datetime) -> Path:
     stem = base / ROOT_NAME / f"{safe_name(info.get('ComputerName'))}_{now:%Y-%m-%d_%H%M%S}"
     folder, n = stem, 1
     while folder.exists():
         n += 1
         folder = stem.with_name(f"{stem.name}_{n}")
     folder.mkdir(parents=True)
+    return folder
+
+
+def write_backup_meta(folder: Path, info: dict, now: datetime, count: int, extra=None):
+    meta = dict(info)
+    meta.update({"Created": now.strftime("%Y-%m-%d %H:%M"), "Drivers": count, "AppVersion": APP_VERSION})
+    meta.update(extra or {})
+    (folder / INFO_JSON).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    note = ""
+    if meta.get("Categories"):
+        note = "\nالفئات المنسوخة: " + "، ".join(CATEGORY_LABELS.get(c, c) for c in meta["Categories"])
+        if meta.get("InUseOnly"):
+            note += "\n(التعريفات المستخدمة حاليًا فقط)"
+    (folder / INFO_TXT).write_text(device_text(info) + f"\nتاريخ النسخة: {meta['Created']}{note}\n", encoding="utf-8-sig")
+
+
+def create_selected_backup(base: Path, info: dict, pkgs, categories, in_use_only, log=print,
+                           progress=lambda i, n: None, runner=run):
+    """ينسخ حزم الفئات المختارة فقط، كل فئة في مجلد فرعي باسمها."""
+    chosen = [p for p in pkgs if p["Category"] in categories and (p["InUse"] or not in_use_only)]
+    if not chosen:
+        return None, "لا توجد تعريفات في الفئات المختارة."
+    now = datetime.now()
+    folder = new_backup_folder(base, info, now)
+    log(f"مجلد النسخة: {folder}")
+    failed = []
+    for i, p in enumerate(chosen, 1):
+        dest = folder / p["Category"] / Path(p["Inf"]).stem
+        dest.mkdir(parents=True, exist_ok=True)
+        rc, out = runner([system_tool("pnputil.exe"), "/export-driver", p["Inf"], str(dest)])
+        if rc != 0 or not inf_files(dest):
+            failed.append(p["Inf"])
+            log(f"تعذر نسخ {p['Inf']} ({p.get('Device') or p.get('Provider')}) — رمز {rc}")
+            shutil.rmtree(dest, ignore_errors=True)
+        progress(i, len(chosen))
+    count = len(inf_files(folder))
+    if not count:
+        shutil.rmtree(folder, ignore_errors=True)
+        return None, "فشل النسخ: لم يُصدَّر أي تعريف. تأكد من التشغيل كمسؤول."
+    write_backup_meta(folder, info, now, count, {"Categories": sorted(set(categories)), "InUseOnly": bool(in_use_only)})
+    msg = f"تم نسخ {count} حزمة تعريف ({format_size(folder_size(folder))})."
+    if failed:
+        msg += f"\nتعذر نسخ {len(failed)} حزمة (التفاصيل في السجل)."
+    return read_backup(folder), msg
+
+
+def create_backup(base: Path, info: dict, log=print, runner=run, ps=powershell):
+    """ينشئ نسخة جديدة في مجلد مستقل. يُرجع (Backup أو None، رسالة)."""
+    now = datetime.now()
+    folder = new_backup_folder(base, info, now)
     log(f"مجلد النسخة: {folder}")
 
     attempts = [
@@ -281,11 +404,8 @@ def create_backup(base: Path, info: dict, log=print, runner=run, ps=powershell):
         shutil.rmtree(folder, ignore_errors=True)
         return None, "فشل النسخ: لم تُصدَّر أي تعريفات بعد تجربة الأدوات الثلاث. تأكد من التشغيل كمسؤول."
 
-    meta = dict(info)
-    meta.update({"Created": now.strftime("%Y-%m-%d %H:%M"), "Drivers": count, "AppVersion": APP_VERSION})
-    (folder / INFO_JSON).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    (folder / INFO_TXT).write_text(device_text(info) + f"\nتاريخ النسخة: {meta['Created']}\n", encoding="utf-8-sig")
-    return read_backup(folder), f"تم النسخ بنجاح: {count} حزمة تعريف."
+    write_backup_meta(folder, info, now, count, {"Categories": ["all"]})
+    return read_backup(folder), f"تم النسخ بنجاح: {count} حزمة تعريف ({format_size(folder_size(folder))})."
 
 
 # ============================================================================
@@ -520,10 +640,123 @@ if tk is not None:
 
         # ------------------------------------------------------------ الأوامر
         def do_backup(self):
+            """يقرأ التعريفات المثبتة ثم يعرض نافذة اختيار الفئات."""
             if self.busy:
                 return
-            self.set_busy(True, "جارٍ النسخ… لا تغلق البرنامج.")
+            self.set_busy(True, "جارٍ قراءة التعريفات المثبتة… (قد يستغرق نصف دقيقة)")
             self.log_text.delete(1.0, tk.END)
+
+            def work():
+                try:
+                    pkgs, err = list_driver_packages(), None
+                except Exception as e:
+                    pkgs, err = None, str(e)
+
+                def done():
+                    self.set_busy(False, "اختر ما تريد نسخه")
+                    if pkgs:
+                        self.choose_categories(pkgs)
+                        return
+                    self.log(f"تعذرت قراءة قائمة التعريفات: {err}" if err else "لم يُعثر على تعريفات مثبتة.")
+                    if messagebox.askyesno("قائمة التعريفات",
+                                           "تعذرت قراءة قائمة التعريفات لاختيار الفئات.\n"
+                                           "هل تريد نسخة كاملة بكل التعريفات بدلًا من ذلك؟"):
+                        self.run_full_backup()
+                self.post(done=done)
+            self.in_background(work)
+
+        def choose_categories(self, pkgs):
+            win = tk.Toplevel(self)
+            win.title("اختر التعريفات المراد نسخها")
+            win.geometry("640x620")
+            win.configure(bg=self.PANEL)
+            win.transient(self)
+            win.grab_set()
+            tk.Label(win, text="ضع علامة ✓ على ما تريد نسخه", font=("Segoe UI", 12, "bold"),
+                     fg="#38bdf8", bg=self.PANEL).pack(anchor="e", padx=16, pady=(14, 4))
+
+            in_use = tk.BooleanVar(value=True)
+            tk.Checkbutton(win, text="التعريفات المستخدمة حاليًا فقط (يتجاهل الإصدارات القديمة المتراكمة، وحجمه أصغر بكثير)",
+                           variable=in_use, font=("Segoe UI", 9, "bold"), fg="#fbbf24", bg=self.PANEL,
+                           selectcolor=self.BG, activebackground=self.PANEL, wraplength=600, justify="right",
+                           command=lambda: refresh()).pack(anchor="e", padx=16, pady=(0, 8))
+
+            box = tk.Frame(win, bg=self.PANEL)
+            box.pack(fill="both", expand=True, padx=16)
+            vars_, labels = {}, {}
+            default_on = {"display", "motherboard", "network", "audio", "bluetooth", "printer"}
+            for key, label, _ in CATEGORIES:
+                row = tk.Frame(box, bg=self.PANEL)
+                row.pack(fill="x", pady=3)
+                v = tk.BooleanVar(value=key in default_on)
+                vars_[key] = v
+                tk.Checkbutton(row, text=label, variable=v, font=("Segoe UI", 10, "bold"), fg="#e2e8f0",
+                               bg=self.PANEL, selectcolor=self.BG, activebackground=self.PANEL,
+                               command=lambda: refresh()).pack(anchor="e")
+                labels[key] = tk.Label(row, text="", font=("Segoe UI", 8), fg="#94a3b8", bg=self.PANEL,
+                                       justify="right", wraplength=580)
+                labels[key].pack(anchor="e", padx=(0, 26))
+
+            total_lbl = tk.Label(win, text="", font=("Segoe UI", 10, "bold"), fg="#38bdf8", bg=self.PANEL)
+            total_lbl.pack(anchor="e", padx=16, pady=6)
+
+            def refresh():
+                summ = summarize(pkgs, in_use.get())
+                total_n = total_s = 0
+                for key, _, _ in CATEGORIES:
+                    c = summ[key]
+                    devs = "، ".join(c["devices"][:3]) + (" …" if len(c["devices"]) > 3 else "")
+                    labels[key].config(text=(f"{c['count']} تعريف • {format_size(c['size'])}" + (f" — {devs}" if devs else ""))
+                                       if c["count"] else "لا يوجد")
+                    if vars_[key].get():
+                        total_n += c["count"]; total_s += c["size"]
+                total_lbl.config(text=f"المحدد: {total_n} تعريف • الحجم التقريبي {format_size(total_s)}")
+                go.config(state="normal" if total_n else "disabled")
+
+            bar = tk.Frame(win, bg=self.PANEL)
+            bar.pack(fill="x", padx=16, pady=12)
+
+            def start():
+                cats = [k for k, v in vars_.items() if v.get()]
+                win.destroy()
+                self.run_selected_backup(pkgs, cats, in_use.get())
+
+            def full():
+                win.destroy()
+                self.run_full_backup()
+
+            go = tk.Button(bar, text="⬆ نسخ المحدد", command=start, font=("Segoe UI", 10, "bold"), bg="#0284c7",
+                           fg="white", relief="flat", padx=16, pady=6, cursor="hand2")
+            go.pack(side="right")
+            tk.Button(bar, text="نسخة كاملة (كل التعريفات)", command=full, font=("Segoe UI", 9), bg="#334155",
+                      fg="white", relief="flat", padx=12, pady=6, cursor="hand2").pack(side="right", padx=8)
+            tk.Button(bar, text="إلغاء", command=win.destroy, font=("Segoe UI", 9), bg="#475569", fg="white",
+                      relief="flat", padx=12, pady=6, cursor="hand2").pack(side="left")
+            refresh()
+
+        def finish_backup(self, b, msg):
+            self.set_busy(False, msg.splitlines()[0])
+            self.log(msg)
+            self.refresh_backups()
+            box = messagebox.showerror if not b else (messagebox.showwarning if "تعذر" in msg else messagebox.showinfo)
+            box("النسخ الاحتياطي", msg)
+
+        def run_selected_backup(self, pkgs, cats, in_use_only):
+            self.set_busy(True, "جارٍ نسخ التعريفات المختارة… لا تغلق البرنامج.")
+            self.progress.stop()
+
+            def work():
+                info = self.device or get_device_info()
+                try:
+                    b, msg = create_selected_backup(self.base, info, pkgs, cats, in_use_only, log=self.log,
+                                                    progress=lambda i, n: self.post(progress=(i, n), status=f"نسخ {i} من {n}"))
+                except Exception as e:
+                    b, msg = None, f"خطأ غير متوقع: {e}"
+                self.post(done=lambda: self.finish_backup(b, msg))
+            self.in_background(work)
+
+        def run_full_backup(self):
+            self.set_busy(True, "جارٍ النسخ الكامل… لا تغلق البرنامج.")
 
             def work():
                 info = self.device or get_device_info()
@@ -531,13 +764,7 @@ if tk is not None:
                     b, msg = create_backup(self.base, info, log=self.log)
                 except Exception as e:
                     b, msg = None, f"خطأ غير متوقع: {e}"
-
-                def done():
-                    self.set_busy(False, msg)
-                    self.log(msg)
-                    self.refresh_backups()
-                    (messagebox.showinfo if b else messagebox.showerror)("النسخ الاحتياطي", msg)
-                self.post(done=done)
+                self.post(done=lambda: self.finish_backup(b, msg))
             self.in_background(work)
 
         def do_restore(self):
