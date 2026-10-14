@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "3.1.1"
+APP_VERSION = "3.1.2"
 APP_TITLE = "نسخ التعريفات — Windows Driver Toolbox"
 ROOT_NAME = "BackupDriver"           # مجلد واحد لكل النسخ، بجانب البرنامج
 LEGACY_NAMES = ("DriversBackup",)    # مجلد الإصدار القديم من القائمة الإنجليزية
@@ -285,11 +285,26 @@ Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.InfName -like 'oem*.in
 """
 
 
-def category_of(class_name: str) -> str:
+# مكونات برمجية يصنّفها ويندوز «SoftwareComponent» أو «Extension» وهي في الحقيقة
+# جزء من تعريفات اللوحة الأم (Intel ME وملحقاتها، وشرائح AMD، وغيرها)
+MOTHERBOARD_HINTS = (
+    "management engine", "dynamic application loader", "icls", "serial io", "chipset",
+    "rapid storage", "smbus", "dynamic tuning", "dptf", "innovation platform framework",
+    "gna", "gaussian", "platform monitoring", "psp", "gpio", "pci device", "pmf",
+)
+
+
+def category_of(class_name: str, name: str = "") -> str:
     c = (class_name or "").strip().lower()
     for key, _, classes in CATEGORIES:
         if c in classes:
             return key
+    low = (name or "").lower()
+    if c in ("softwarecomponent", "extension"):
+        if any(h in low for h in MOTHERBOARD_HINTS):
+            return "motherboard"
+        if "audio" in low or "sound" in low:
+            return "audio"
     return "other"
 
 
@@ -306,7 +321,7 @@ def list_driver_packages(ps=powershell):
     for p in data:
         if not p.get("Inf"):
             continue
-        p["Category"] = category_of(p.get("Class"))
+        p["Category"] = category_of(p.get("Class"), f"{p.get('Device', '')} {p.get('Provider', '')}")
         p["Size"] = int(p.get("Size") or 0)
         p["InUse"] = bool(p.get("InUse"))
         pkgs.append(p)
