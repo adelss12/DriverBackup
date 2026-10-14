@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.1.1"
 APP_TITLE = "نسخ التعريفات — Windows Driver Toolbox"
 ROOT_NAME = "BackupDriver"           # مجلد واحد لكل النسخ، بجانب البرنامج
 LEGACY_NAMES = ("DriversBackup",)    # مجلد الإصدار القديم من القائمة الإنجليزية
@@ -256,7 +256,7 @@ def backup_inf_files(b: Backup):
 # فئات التعريفات التي يختار منها المستخدم (حسب «فئة الجهاز» في ويندوز)
 CATEGORIES = [
     ("display", "كرت الشاشة", {"display"}),
-    ("motherboard", "اللوحة الأم والشرائح (Chipset و USB و التخزين)",
+    ("motherboard", "اللوحة الأم والشرائح ومنافذ يو إس بي والتخزين",
      {"system", "hdc", "scsiadapter", "usb", "securitydevices", "firmware", "processor", "smartcardreader"}),
     ("network", "الشبكة (واي فاي وإيثرنت)", {"net", "netservice", "nettrans", "netclient"}),
     ("audio", "الصوت", {"media", "audioendpoint", "audioprocessingobject"}),
@@ -326,6 +326,25 @@ def summarize(pkgs, in_use_only=False):
         if name and name not in c["devices"]:
             c["devices"].append(name)
     return out
+
+
+def size_ar(n: float) -> str:
+    """الحجم بوحدات عربية حتى لا تنقلب الجملة عند خلط العربي بالإنجليزي."""
+    for unit in ("بايت", "كيلوبايت", "ميجابايت", "جيجابايت"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "بايت" else f"{int(n)} {unit}"
+        n /= 1024
+    return f"{n:.1f} تيرابايت"
+
+
+def count_ar(n: int) -> str:
+    if n == 1:
+        return "تعريف واحد"
+    if n == 2:
+        return "تعريفان"
+    if 3 <= n <= 10:
+        return f"{n} تعريفات"
+    return f"{n} تعريفًا"
 
 
 def new_backup_folder(base: Path, info: dict, now: datetime) -> Path:
@@ -665,56 +684,78 @@ if tk is not None:
                 self.post(done=done)
             self.in_background(work)
 
+        def check_row(self, parent, var, text, font, fg, command=None):
+            """مربع الاختيار يمين النص (الاتجاه العربي)، والضغط على النص يغيّر الاختيار أيضًا."""
+            row = tk.Frame(parent, bg=self.PANEL)
+            row.pack(fill="x", anchor="e")
+            tk.Checkbutton(row, variable=var, bg=self.PANEL, activebackground=self.PANEL, selectcolor=self.BG,
+                           command=command, cursor="hand2").pack(side="right")
+            lbl = tk.Label(row, text=text, font=font, fg=fg, bg=self.PANEL, cursor="hand2", justify="right")
+            lbl.pack(side="right")
+
+            def toggle(_e=None):
+                var.set(not var.get())
+                if command:
+                    command()
+            lbl.bind("<Button-1>", toggle)
+            return row
+
         def choose_categories(self, pkgs):
             win = tk.Toplevel(self)
             win.title("اختر التعريفات المراد نسخها")
-            win.geometry("640x620")
+            win.geometry("760x820")
+            win.minsize(640, 680)
             win.configure(bg=self.PANEL)
             win.transient(self)
             win.grab_set()
-            tk.Label(win, text="ضع علامة ✓ على ما تريد نسخه", font=("Segoe UI", 12, "bold"),
-                     fg="#38bdf8", bg=self.PANEL).pack(anchor="e", padx=16, pady=(14, 4))
+            tk.Label(win, text="ضع علامة على ما تريد نسخه", font=("Segoe UI", 15, "bold"),
+                     fg="#38bdf8", bg=self.PANEL).pack(anchor="e", padx=18, pady=(16, 6))
 
             in_use = tk.BooleanVar(value=True)
-            tk.Checkbutton(win, text="التعريفات المستخدمة حاليًا فقط (يتجاهل الإصدارات القديمة المتراكمة، وحجمه أصغر بكثير)",
-                           variable=in_use, font=("Segoe UI", 9, "bold"), fg="#fbbf24", bg=self.PANEL,
-                           selectcolor=self.BG, activebackground=self.PANEL, wraplength=600, justify="right",
-                           command=lambda: refresh()).pack(anchor="e", padx=16, pady=(0, 8))
+            self.check_row(win, in_use, "التعريفات المستخدمة حاليًا فقط", ("Segoe UI", 12, "bold"), "#fbbf24",
+                           command=lambda: refresh()).pack_configure(padx=18)
+            tk.Label(win, text="يتجاهل الإصدارات القديمة المتراكمة، فيكون حجم النسخة أصغر بكثير",
+                     font=("Segoe UI", 10), fg="#94a3b8", bg=self.PANEL).pack(anchor="e", padx=(18, 48), pady=(0, 10))
 
             box = tk.Frame(win, bg=self.PANEL)
-            box.pack(fill="both", expand=True, padx=16)
-            vars_, labels = {}, {}
+            box.pack(fill="both", expand=True, padx=18)
+            vars_, stats, devices = {}, {}, {}
             default_on = {"display", "motherboard", "network", "audio", "bluetooth", "printer"}
             for key, label, _ in CATEGORIES:
-                row = tk.Frame(box, bg=self.PANEL)
-                row.pack(fill="x", pady=3)
                 v = tk.BooleanVar(value=key in default_on)
                 vars_[key] = v
-                tk.Checkbutton(row, text=label, variable=v, font=("Segoe UI", 10, "bold"), fg="#e2e8f0",
-                               bg=self.PANEL, selectcolor=self.BG, activebackground=self.PANEL,
-                               command=lambda: refresh()).pack(anchor="e")
-                labels[key] = tk.Label(row, text="", font=("Segoe UI", 8), fg="#94a3b8", bg=self.PANEL,
-                                       justify="right", wraplength=580)
-                labels[key].pack(anchor="e", padx=(0, 26))
+                self.check_row(box, v, label, ("Segoe UI", 12, "bold"), "#e2e8f0",
+                               command=lambda: refresh()).pack_configure(pady=(8, 0))
+                # سطر عربي للعدد والحجم، وسطر مستقل لأسماء القطع الإنجليزية
+                stats[key] = tk.Label(box, text="", font=("Segoe UI", 10), fg="#94a3b8", bg=self.PANEL)
+                stats[key].pack(anchor="e", padx=(0, 30))
+                devices[key] = tk.Label(box, text="", font=("Segoe UI", 9), fg="#64748b", bg=self.PANEL,
+                                        justify="left", wraplength=640, anchor="e")
+                devices[key].pack(anchor="e", padx=(0, 30))
 
-            total_lbl = tk.Label(win, text="", font=("Segoe UI", 10, "bold"), fg="#38bdf8", bg=self.PANEL)
-            total_lbl.pack(anchor="e", padx=16, pady=6)
+            total_lbl = tk.Label(win, text="", font=("Segoe UI", 12, "bold"), fg="#38bdf8", bg=self.PANEL)
+            total_lbl.pack(anchor="e", padx=18, pady=8)
 
             def refresh():
                 summ = summarize(pkgs, in_use.get())
                 total_n = total_s = 0
                 for key, _, _ in CATEGORIES:
                     c = summ[key]
-                    devs = "، ".join(c["devices"][:3]) + (" …" if len(c["devices"]) > 3 else "")
-                    labels[key].config(text=(f"{c['count']} تعريف • {format_size(c['size'])}" + (f" — {devs}" if devs else ""))
-                                       if c["count"] else "لا يوجد")
+                    if c["count"]:
+                        stats[key].config(text=f"{count_ar(c['count'])}  •  {size_ar(c['size'])}")
+                        names = c["devices"][:3]
+                        devices[key].config(text="  |  ".join(names) + ("  …" if len(c["devices"]) > 3 else ""))
+                    else:
+                        stats[key].config(text="لا يوجد")
+                        devices[key].config(text="")
                     if vars_[key].get():
-                        total_n += c["count"]; total_s += c["size"]
-                total_lbl.config(text=f"المحدد: {total_n} تعريف • الحجم التقريبي {format_size(total_s)}")
+                        total_n += c["count"]
+                        total_s += c["size"]
+                total_lbl.config(text=f"المحدد: {count_ar(total_n)}  •  الحجم التقريبي {size_ar(total_s)}")
                 go.config(state="normal" if total_n else "disabled")
 
             bar = tk.Frame(win, bg=self.PANEL)
-            bar.pack(fill="x", padx=16, pady=12)
+            bar.pack(fill="x", padx=18, pady=14)
 
             def start():
                 cats = [k for k, v in vars_.items() if v.get()]
@@ -725,13 +766,13 @@ if tk is not None:
                 win.destroy()
                 self.run_full_backup()
 
-            go = tk.Button(bar, text="⬆ نسخ المحدد", command=start, font=("Segoe UI", 10, "bold"), bg="#0284c7",
-                           fg="white", relief="flat", padx=16, pady=6, cursor="hand2")
+            go = tk.Button(bar, text="⬆ نسخ المحدد", command=start, font=("Segoe UI", 12, "bold"), bg="#0284c7",
+                           fg="white", relief="flat", padx=20, pady=8, cursor="hand2")
             go.pack(side="right")
-            tk.Button(bar, text="نسخة كاملة (كل التعريفات)", command=full, font=("Segoe UI", 9), bg="#334155",
-                      fg="white", relief="flat", padx=12, pady=6, cursor="hand2").pack(side="right", padx=8)
-            tk.Button(bar, text="إلغاء", command=win.destroy, font=("Segoe UI", 9), bg="#475569", fg="white",
-                      relief="flat", padx=12, pady=6, cursor="hand2").pack(side="left")
+            tk.Button(bar, text="نسخة كاملة لكل التعريفات", command=full, font=("Segoe UI", 11), bg="#334155",
+                      fg="white", relief="flat", padx=14, pady=8, cursor="hand2").pack(side="right", padx=10)
+            tk.Button(bar, text="إلغاء", command=win.destroy, font=("Segoe UI", 11), bg="#475569", fg="white",
+                      relief="flat", padx=16, pady=8, cursor="hand2").pack(side="left")
             refresh()
 
         def finish_backup(self, b, msg):
